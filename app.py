@@ -299,7 +299,7 @@ if merged['max_hr'].notna().any():
 # monthly HR summary
 st.subheader("Monthly avg HR summary")
 if 'month' not in merged.columns:
-    merged['month'] = pd.to_datetime(merged['date']).astype('datetime64[ns]').astype('datetime64[M]')
+    merged["month"] = pd.to_datetime(merged["date"]).dt.to_period("M").dt.to_timestamp()
 monthly_hr = merged.groupby('month').agg({'avg_hr':'mean','max_hr':'mean'}).reset_index()
 if not monthly_hr.empty:
     mchart = alt.Chart(monthly_hr).transform_fold(
