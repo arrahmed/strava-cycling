@@ -91,7 +91,8 @@ st.write({
 
 # Parse date
 if date_col:
-    dfc['date'] = pd.to_datetime(dfc[date_col], errors='coerce').dt.date
+    # keep as datetime (not only date) to keep Altair happy
+    dfc['date'] = pd.to_datetime(dfc[date_col], errors='coerce')
 else:
     st.error("No date column detected in cycling CSV. Ensure there's a 'date' column.")
     st.stop()
@@ -117,7 +118,9 @@ dfc['max_hr'] = safe_num(dfc[max_hr_col]) if max_hr_col else np.nan
 dfc['ride_name'] = dfc[name_col].astype(str) if name_col else ("ride_" + dfc.index.astype(str))
 
 # Aggregate to per-day (mean for power/hr, sum for distance/time/tss)
-daily = dfc.groupby('date').agg({
+# ensure dfc['date'] is datetime -> groupby by date().date if we want per-day; we'll aggregate by calendar day
+dfc['date_only'] = pd.to_datetime(dfc['date']).dt.date
+daily = dfc.groupby('date_only').agg({
     'distance_km':'sum',
     'moving_hours':'sum',
     'avg_power_w':'mean',
@@ -126,7 +129,10 @@ daily = dfc.groupby('date').agg({
     'tss':'sum',
     'avg_hr':'mean',
     'max_hr':'max'
-}).reset_index().sort_values('date')
+}).reset_index().rename(columns={'date_only':'date'}).sort_values('date')
+
+# ensure merged-ready date column is datetime64[ns]
+daily['date'] = pd.to_datetime(daily['date'], errors='coerce')
 
 # show sample
 st.subheader("Per-day aggregated cycling (sample)")
@@ -148,15 +154,24 @@ if sl_file:
         shrv_col = find(list(sleep_raw.columns), ["hrv"])
         # normalize
         if sdate_col:
-            sleep_raw['date'] = pd.to_datetime(sleep_raw[sdate_col], errors='coerce').dt.date
+            sleep_raw['date'] = pd.to_datetime(sleep_raw[sdate_col], errors='coerce')
         else:
             sleep_raw['date'] = pd.NaT
         sleep_raw['sleep_hours'] = safe_num(sleep_raw[sh_col]) if sh_col else np.nan
         sleep_raw['sleep_quality'] = safe_num(sleep_raw[sq_col]) if sq_col else np.nan
         sleep_raw['resting_hr'] = safe_num(sleep_raw[srhr_col]) if srhr_col else np.nan
         sleep_raw['hrv'] = safe_num(sleep_raw[shrv_col]) if shrv_col else np.nan
-        # aggregate per-night
-        sleep_df = sleep_raw.groupby('date').agg({'sleep_hours':'sum','sleep_quality':'mean','resting_hr':'mean','hrv':'mean'}).reset_index()
+        # aggregate per-night (use date's date component)
+        sleep_raw['date'] = pd.to_datetime(sleep_raw['date'], errors='coerce')
+        sleep_raw['date_only'] = sleep_raw['date'].dt.date
+        sleep_df = sleep_raw.groupby('date_only').agg({
+            'sleep_hours':'sum',
+            'sleep_quality':'mean',
+            'resting_hr':'mean',
+            'hrv':'mean'
+        }).reset_index().rename(columns={'date_only':'date'})
+        # make date datetime
+        sleep_df['date'] = pd.to_datetime(sleep_df['date'], errors='coerce')
         st.subheader("Sleep (per-night)")
         st.dataframe(sleep_df.head(10))
     except Exception as e:
@@ -170,9 +185,13 @@ else:
 # -------------------------
 # Convention: sleep on date D maps to rides on date D+1
 if sleep_df is not None and not sleep_df.empty:
-    sleep_df['next_date'] = pd.to_datetime(sleep_df['date']) + pd.Timedelta(days=1)
-    sleep_df['next_date'] = sleep_df['next_date'].dt.date
-    merged = daily.merge(sleep_df[['next_date','sleep_hours','sleep_quality','resting_hr','hrv']], left_on='date', right_on='next_date', how='left')
+    sleep_df['next_date'] = sleep_df['date'] + pd.Timedelta(days=1)
+    # normalize types
+    sleep_df['next_date'] = pd.to_datetime(sleep_df['next_date'], errors='coerce')
+    merged = daily.merge(
+        sleep_df[['next_date','sleep_hours','sleep_quality','resting_hr','hrv']].rename(columns={'next_date':'date'}),
+        on='date', how='left'
+    )
 else:
     merged = daily.copy()
     merged['sleep_hours'] = np.nan
@@ -180,11 +199,18 @@ else:
     merged['resting_hr'] = np.nan
     merged['hrv'] = np.nan
 
+# Ensure merged.date is datetime
+merged['date'] = pd.to_datetime(merged['date'], errors='coerce')
+
 # -------------------------
 # Sidebar: max_hr input (for intensity calc) and FTP not required here
 # -------------------------
 st.sidebar.header("HR & intensity settings")
-user_max_hr = st.sidebar.number_input("Estimated Max HR (bpm) — used for HR zone/intensity", min_value=120, max_value=250, value=int(np.nanmean(merged['max_hr'].dropna()) if merged['max_hr'].notna().any() else 190))
+user_max_hr = st.sidebar.number_input(
+    "Estimated Max HR (bpm) — used for HR zone/intensity",
+    min_value=120, max_value=250,
+    value=int(np.nanmean(merged['max_hr'].dropna()) if merged['max_hr'].notna().any() else 190)
+)
 st.sidebar.caption("If unknown, use 220 - age as a rough estimate.")
 
 # -------------------------
@@ -192,7 +218,12 @@ st.sidebar.caption("If unknown, use 220 - age as a rough estimate.")
 # -------------------------
 st.header("HR → Power Efficiency")
 
-if merged['avg_hr'].notna().any() and merged['avg_power_w'].notna().any():
+# ensure numeric types
+for c in ['avg_power_w','avg_hr']:
+    if c in merged.columns:
+        merged[c] = pd.to_numeric(merged[c], errors='coerce')
+
+if merged.get('avg_hr').notna().any() and merged.get('avg_power_w').notna().any():
     merged['watts_per_bpm'] = merged['avg_power_w'] / merged['avg_hr']
     # show recent trend + distribution
     st.subheader("Watts per bpm (avg_power / avg_hr) — higher = more efficient")
@@ -203,7 +234,8 @@ if merged['avg_hr'].notna().any() and merged['avg_power_w'].notna().any():
     ).properties(height=300).interactive()
     st.altair_chart(chart, use_container_width=True)
     st.write("Higher watts per bpm = more power produced for each heart-beat on average (good).")
-    st.metric("Most recent watts_per_bpm", f"{merged['watts_per_bpm'].iloc[-1]:.2f}" if not isnan(merged['watts_per_bpm'].iloc[-1]) else "N/A")
+    last_val = merged['watts_per_bpm'].dropna().iloc[-1] if merged['watts_per_bpm'].dropna().size>0 else np.nan
+    st.metric("Most recent watts_per_bpm", f"{last_val:.2f}" if not isnan(last_val) else "N/A")
 else:
     st.info("Not enough avg_hr or avg_power data to compute watts_per_bpm.")
 
@@ -298,17 +330,31 @@ if merged['max_hr'].notna().any():
 
 # monthly HR summary
 st.subheader("Monthly avg HR summary")
-if 'month' not in merged.columns:
-    merged["month"] = pd.to_datetime(merged["date"]).dt.to_period("M").dt.to_timestamp()
-monthly_hr = merged.groupby('month').agg({'avg_hr':'mean','max_hr':'mean'}).reset_index()
+# SAFELY create month column and ensure types are correct
+merged['month'] = pd.to_datetime(merged['date'], errors='coerce').dt.to_period("M").dt.to_timestamp()
+# convert avg/max to numeric and compute monthly means, drop rows with no values
+merged['avg_hr'] = pd.to_numeric(merged['avg_hr'], errors='coerce')
+merged['max_hr'] = pd.to_numeric(merged['max_hr'], errors='coerce')
+monthly_hr = merged.groupby('month', as_index=False).agg({'avg_hr':'mean','max_hr':'mean'}).reset_index(drop=True)
+# drop rows where both avg_hr and max_hr are NaN
+monthly_hr = monthly_hr.dropna(subset=['avg_hr','max_hr'], how='all')
 if not monthly_hr.empty:
-    mchart = alt.Chart(monthly_hr).transform_fold(
-        ['avg_hr','max_hr'],
-        as_ = ['type','value']
-    ).mark_line(point=True).encode(
-        x='month:T', y='value:Q', color='type:N', tooltip=['month','type','value']
-    ).properties(height=300).interactive()
-    st.altair_chart(mchart, use_container_width=True)
+    # altair prefers clear typings; ensure month is datetime
+    monthly_hr['month'] = pd.to_datetime(monthly_hr['month'], errors='coerce')
+    # melt for line plot with legend
+    melt = monthly_hr.melt(id_vars=['month'], value_vars=['avg_hr','max_hr'], var_name='type', value_name='value')
+    # drop NA rows
+    melt = melt.dropna(subset=['value'])
+    if not melt.empty:
+        mchart = alt.Chart(melt).mark_line(point=True).encode(
+            x=alt.X('month:T', title='Month'),
+            y=alt.Y('value:Q', title='Heart Rate (bpm)'),
+            color=alt.Color('type:N', title='Metric'),
+            tooltip=['month','type','value']
+        ).properties(height=300).interactive()
+        st.altair_chart(mchart, use_container_width=True)
+    else:
+        st.info("Not enough monthly HR data to plot after cleaning.")
 else:
     st.info("Not enough HR data to produce monthly summary.")
 
