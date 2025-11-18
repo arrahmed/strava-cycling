@@ -1,131 +1,117 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
+import numpy as np
 
-st.set_page_config(page_title="Strava Cycling Dashboard", layout="wide")
+# ----------------------------------------
+# Utility: fuzzy column finder
+# ----------------------------------------
+def find_col(possible_names, df):
+    cols = df.columns.str.lower().str.replace(" ", "").str.replace("_", "")
+    for name in possible_names:
+        for col in df.columns:
+            if name in col.lower().replace(" ", "").replace("_", ""):
+                return col
+    return None
 
-st.title("🚴 Strava Cycling Dashboard")
-st.write("Upload your Strava export CSV and get an automatically generated cycling dashboard.")
+# ----------------------------------------
+# Page setup
+# ----------------------------------------
+st.set_page_config(page_title="Strava Activity Dashboard", layout="wide")
+st.title("🚴 Strava Activity Dashboard")
 
-# ----------------------------
-# 1. Upload File
-# ----------------------------
-file = st.file_uploader("Upload Strava CSV", type=["csv"])
+uploaded = st.file_uploader("Upload your Strava activities CSV", type=["csv"])
 
-if file is None:
+if uploaded is None:
+    st.info("Upload activities.csv to begin.")
     st.stop()
 
-# ----------------------------
-# 2. Load CSV
-# ----------------------------
-try:
-    df = pd.read_csv(file)
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+df = pd.read_csv(uploaded)
 
-# Normalize column names
-df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+# ----------------------------------------
+# Detect core columns automatically
+# ----------------------------------------
+distance_col = find_col(["distance"], df)
+speed_col = find_col(["averagespeed", "avgspeed", "speed"], df)
+date_col = find_col(["startdatelocal", "startdate", "date"], df)
+sport_col = find_col(["sporttype", "type", "activitytype"], df)
 
-st.subheader("Raw Data Preview")
-st.dataframe(df.head())
+# ----------------------------------------
+# Normalize / convert values
+# ----------------------------------------
+if distance_col:
+    # Convert meters → km
+    df["distance_km"] = df[distance_col] / 1000
 
-# ----------------------------
-# 3. Safety Checks
-# ----------------------------
-if "sport_type" not in df.columns:
-    st.error("Your Strava CSV does not contain a 'sport_type' column. "
-             "Export the full Strava 'All Activities' CSV.")
-    st.stop()
-
-# ----------------------------
-# 4. Extract Cycling Only
-# ----------------------------
-cycling_keywords = [
-    "ride", "virtualride", "ebikeride",
-    "gravelride", "mountainbikeride"
-]
-
-df["sport_type_clean"] = df["sport_type"].astype(str).str.lower()
-
-df_cyc = df[df["sport_type_clean"].isin(cycling_keywords)].copy()
-
-if df_cyc.empty:
-    st.error("No cycling activities found in your file.")
-    st.stop()
-
-st.success(f"Found **{len(df_cyc)}** cycling activities.")
-
-# ----------------------------
-# 5. Convert Dates (if possible)
-# ----------------------------
-date_col = None
-for col in ["start_date", "start_date_local", "activity_date", "date"]:
-    if col in df_cyc.columns:
-        date_col = col
-        break
+if speed_col:
+    # Strava average_speed = m/s, convert to km/h
+    df["speed_kmh"] = df[speed_col] * 3.6
 
 if date_col:
-    df_cyc[date_col] = pd.to_datetime(df_cyc[date_col], errors="ignore")
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+    df["date_pretty"] = df["date"].dt.strftime("%a, %d %b %Y")
+
+if sport_col:
+    df["sport"] = df[sport_col].astype(str)
 else:
-    st.warning("No date column found — skipping date-based charts.")
+    df["sport"] = "Activity"
 
-# ----------------------------
-# 6. Show Summary Stats
-# ----------------------------
-st.subheader("📊 Key Stats")
+# ----------------------------------------
+# Sidebar filtering
+# ----------------------------------------
+unique_sports = sorted(df["sport"].dropna().unique())
+selected_sport = st.sidebar.selectbox("🏅 Select Activity Type", unique_sports)
 
-cols = st.columns(3)
+df_filtered = df[df["sport"] == selected_sport]
 
-# Distance
-if "distance" in df_cyc.columns:
-    total_km = df_cyc["distance"].sum() / 1000 if df_cyc["distance"].max() > 100 else df_cyc["distance"].sum()
-    cols[0].metric("Total Distance (km)", f"{total_km:,.1f}")
-else:
-    cols[0].metric("Total Distance", "N/A")
+st.subheader(f"📊 Dashboard for {selected_sport}")
 
-# Time
-if "moving_time" in df_cyc.columns:
-    total_hours = df_cyc["moving_time"].sum() / 3600
-    cols[1].metric("Total Moving Time (hrs)", f"{total_hours:,.1f}")
-else:
-    cols[1].metric("Total Moving Time", "N/A")
+# ----------------------------------------
+# Summary Metrics
+# ----------------------------------------
+col1, col2, col3 = st.columns(3)
 
-# Average Speed
-if "average_speed" in df_cyc.columns:
-    avg_speed = df_cyc["average_speed"].mean()
-    cols[2].metric("Avg Speed (m/s)", f"{avg_speed:,.2f}")
-else:
-    cols[2].metric("Avg Speed", "N/A")
+if distance_col:
+    total_km = df_filtered["distance_km"].sum()
+    col1.metric("Total Distance (km)", f"{total_km:,.1f}")
 
-# ----------------------------
-# 7. Charts
-# ----------------------------
+if speed_col:
+    avg_speed = df_filtered["speed_kmh"].mean()
+    col2.metric("Avg Speed (km/h)", f"{avg_speed:,.1f}")
 
-st.subheader("📈 Cycling Activity Charts")
+col3.metric("Activities Count", len(df_filtered))
 
-# Distance over time
-if date_col and "distance" in df_cyc.columns:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    df_cyc_sorted = df_cyc.sort_values(date_col)
-    ax.plot(df_cyc_sorted[date_col], df_cyc_sorted["distance"])
-    ax.set_ylabel("Distance")
-    ax.set_title("Distance Over Time")
-    st.pyplot(fig)
+# ----------------------------------------
+# Charts
+# ----------------------------------------
+st.divider()
+st.subheader("📈 Trends Over Time")
 
-# Moving time histogram
-if "moving_time" in df_cyc.columns:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.hist(df_cyc["moving_time"], bins=30)
-    ax.set_title("Distribution of Moving Time (seconds)")
-    st.pyplot(fig)
+if date_col and distance_col:
+    st.line_chart(df_filtered.sort_values("date"), x="date", y="distance_km", height=300)
 
-# Speed histogram
-if "average_speed" in df_cyc.columns:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.hist(df_cyc["average_speed"], bins=30)
-    ax.set_title("Distribution of Average Speed")
-    st.pyplot(fig)
+if date_col and speed_col:
+    st.line_chart(df_filtered.sort_values("date"), x="date", y="speed_kmh", height=300)
 
-st.markdown("---")
-st.write("Dashboard complete 🚀")
+# ----------------------------------------
+# Data Table
+# ----------------------------------------
+st.divider()
+st.subheader("📄 Activity Records")
+
+show_cols = ["date_pretty", "sport"]
+if distance_col:
+    show_cols.append("distance_km")
+if speed_col:
+    show_cols.append("speed_kmh")
+
+st.dataframe(df_filtered[show_cols])
+
+# ----------------------------------------
+# Export filtered data
+# ----------------------------------------
+csv_export = df_filtered.to_csv(index=False)
+st.download_button(
+    "⬇️ Download Filtered CSV", 
+    data=csv_export, 
+    file_name=f"{selected_sport}_history.csv"
+)
