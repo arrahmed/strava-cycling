@@ -1,391 +1,148 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from datetime import timedelta
-from sklearn.linear_model import LinearRegression
-from math import isnan
 
-st.set_page_config(page_title="HR × Power × Sleep Dashboard", layout="wide")
-st.title("❤️ HR × 🚴 Power × 😴 Sleep — Correlation & Trends")
+st.set_page_config(page_title="Cycling Dashboard", layout="wide")
+st.title("🚴 Cycling Metrics Dashboard")
 
-st.write(
-    "Upload two CSVs: (1) cycling per-ride CSV and (2) nightly sleep CSV. "
-    "This app computes HR↔Power efficiency, sleep→next-day power correlations, HR trends, and HR-based intensity load."
+# -------------------------
+# Upload CSV
+# -------------------------
+csv_file = st.file_uploader("Upload cycling activities CSV", type=["csv"])
+if not csv_file:
+    st.stop()
+
+# -------------------------
+# Load CSV
+# -------------------------
+df = pd.read_csv(csv_file)
+df.columns = [c.strip() for c in df.columns]
+
+# Filter for rides
+df['Activity Type'] = df['Activity Type'].str.strip().str.lower()
+cycling_df = df[df['Activity Type'] == 'ride'].copy()
+
+# -------------------------
+# Preprocess
+# -------------------------
+cycling_df['Activity Date'] = pd.to_datetime(cycling_df['Activity Date'])
+cycling_df['Elapsed Hours'] = cycling_df['Elapsed Time'] / 3600  # if seconds
+cycling_df['Distance KM'] = cycling_df['Distance']  # assuming km
+
+cycling_df['Year'] = cycling_df['Activity Date'].dt.year
+cycling_df['Month'] = cycling_df['Activity Date'].dt.month
+cycling_df['Month_Year'] = cycling_df['Activity Date'].dt.to_period('M').dt.to_timestamp()
+
+# Sidebar filters
+st.sidebar.header("Filters")
+years = sorted(cycling_df['Year'].unique())
+selected_year = st.sidebar.selectbox("Select Year", years, index=len(years)-1)
+months = sorted(cycling_df['Month'].unique())
+selected_month = st.sidebar.selectbox("Select Month", months, index=0)
+
+df_filtered = cycling_df[cycling_df['Year'] == selected_year]
+
+# -------------------------
+# Aggregations
+# -------------------------
+monthly_stats = df_filtered.groupby('Month_Year').agg(
+    rides=('Activity ID', 'count'),
+    distance_km=('Distance KM', 'sum'),
+    elapsed_hours=('Elapsed Hours', 'sum'),
+    avg_hr=('Average Heart Rate', 'mean'),
+    max_hr=('Max Heart Rate', 'mean')
+).reset_index()
+
+yearly_stats = df_filtered.groupby('Year').agg(
+    rides=('Activity ID', 'count'),
+    distance_km=('Distance KM', 'sum'),
+    elapsed_hours=('Elapsed Hours', 'sum'),
+    avg_hr=('Average Heart Rate', 'mean'),
+    max_hr=('Max Heart Rate', 'mean')
+).reset_index()
+
+# MTD stats
+df_mtd = df_filtered[df_filtered['Month'] == selected_month]
+mtd_stats = df_mtd.agg(
+    rides=('Activity ID', 'count'),
+    distance_km=('Distance KM', 'sum'),
+    elapsed_hours=('Elapsed Hours', 'sum')
 )
 
 # -------------------------
-# Upload boxes (two files)
+# Overview metrics
 # -------------------------
-c1, c2 = st.columns([2, 1])
-with c1:
-    cy_file = st.file_uploader("1) Upload cycling CSV (required) — headers: date, moving_hours, distance_km, avg_power, np_power, if, tss", type=["csv"])
-with c2:
-    sl_file = st.file_uploader("2) Upload sleep CSV (optional) — headers: date, sleep_hours, sleep_quality, resting_hr, hrv", type=["csv"])
-
-if not cy_file:
-    st.info("Upload your cycling CSV to start. Use the mock CSV if testing.")
-    st.stop()
+st.subheader(f"Overview Metrics ({selected_year})")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Total Rides", f"{yearly_stats['rides'].sum()}")
+col2.metric("Total Distance (km)", f"{yearly_stats['distance_km'].sum():.1f}")
+col3.metric("Total Riding Hours", f"{yearly_stats['elapsed_hours'].sum():.1f}")
+col4.metric("Average HR (bpm)", f"{yearly_stats['avg_hr'].mean():.1f}")
 
 # -------------------------
-# Helper
+# YoY comparison charts
 # -------------------------
-def safe_num(series):
-    return pd.to_numeric(series, errors="coerce")
+st.subheader("Year-over-Year Comparison")
+# Rides YoY
+rides_chart = alt.Chart(df.groupby('Year').agg(rides=('Activity ID','count')).reset_index()
+                       ).mark_bar().encode(
+    x='Year:O', y='rides:Q', tooltip=['Year','rides']
+).properties(height=300)
+st.altair_chart(rides_chart, use_container_width=True)
 
-def pearson_r(x, y):
-    return x.corr(y)
-
-# -------------------------
-# Load cycling CSV (we expect one row per ride)
-# -------------------------
-try:
-    dfc = pd.read_csv(cy_file)
-except Exception as e:
-    st.error(f"Couldn't read cycling CSV: {e}")
-    st.stop()
-
-# Normalize column names (strip)
-dfc.columns = [c.strip() for c in dfc.columns]
-
-# Map expected columns using exact names you supplied (but also tolerate slight variants)
-col_map = {}
-def find(cols, candidates):
-    for cand in candidates:
-        if cand in cols:
-            return cand
-    # fuzzy lower/strip match
-    lowcols = {c.lower().replace(" ", "").replace("_",""): c for c in cols}
-    for cand in candidates:
-        key = cand.lower().replace(" ", "").replace("_","")
-        if key in lowcols:
-            return lowcols[key]
-    return None
-
-cols = list(dfc.columns)
-date_col = find(cols, ["date", "start_date", "start_date_local"])
-moving_col = find(cols, ["moving_hours", "moving_time", "movinghours", "moving_time_seconds", "elapsed_time"])
-dist_col = find(cols, ["distance_km", "distance", "distance_m", "distance_km"])
-avg_power_col = find(cols, ["avg_power", "average_watts", "average_power", "avg_power_w"])
-np_col = find(cols, ["np_power", "normalized_power", "weighted_average_watts"])
-if_col = find(cols, ["if", "intensity_factor"])
-tss_col = find(cols, ["tss", "training_stress_score"])
-avg_hr_col = find(cols, ["average_heartrate", "avg_heartrate", "avg_hr", "average_hr"])
-max_hr_col = find(cols, ["max_heartrate", "max_hr", "peak_heartrate"])
-name_col = find(cols, ["name", "ride_name", "activity_name"])
-
-# Inform detected mapping
-st.subheader("Detected cycling columns")
-st.write({
-    "date_col": date_col,
-    "moving_col": moving_col,
-    "distance_col": dist_col,
-    "avg_power_col": avg_power_col,
-    "np_col": np_col,
-    "if_col": if_col,
-    "tss_col": tss_col,
-    "avg_hr_col": avg_hr_col,
-    "max_hr_col": max_hr_col
-})
-
-# Parse date
-if date_col:
-    # keep as datetime (not only date) to keep Altair happy
-    dfc['date'] = pd.to_datetime(dfc[date_col], errors='coerce')
-else:
-    st.error("No date column detected in cycling CSV. Ensure there's a 'date' column.")
-    st.stop()
-
-# canonical columns
-dfc['distance_km'] = safe_num(dfc[dist_col]) if dist_col else np.nan
-# moving_hours: if value seems >24 assume seconds and convert
-if moving_col:
-    mv = safe_num(dfc[moving_col])
-    if mv.max(skipna=True) is not None and mv.max(skipna=True) > 24:  # seconds likely
-        dfc['moving_hours'] = mv / 3600.0
-    else:
-        dfc['moving_hours'] = mv
-else:
-    dfc['moving_hours'] = np.nan
-
-dfc['avg_power_w'] = safe_num(dfc[avg_power_col]) if avg_power_col else np.nan
-dfc['np_power_w'] = safe_num(dfc[np_col]) if np_col else np.nan
-dfc['if'] = safe_num(dfc[if_col]) if if_col else np.nan
-dfc['tss'] = safe_num(dfc[tss_col]) if tss_col else np.nan
-dfc['avg_hr'] = safe_num(dfc[avg_hr_col]) if avg_hr_col else np.nan
-dfc['max_hr'] = safe_num(dfc[max_hr_col]) if max_hr_col else np.nan
-dfc['ride_name'] = dfc[name_col].astype(str) if name_col else ("ride_" + dfc.index.astype(str))
-
-# Aggregate to per-day (mean for power/hr, sum for distance/time/tss)
-# ensure dfc['date'] is datetime -> groupby by date().date if we want per-day; we'll aggregate by calendar day
-dfc['date_only'] = pd.to_datetime(dfc['date']).dt.date
-daily = dfc.groupby('date_only').agg({
-    'distance_km':'sum',
-    'moving_hours':'sum',
-    'avg_power_w':'mean',
-    'np_power_w':'mean',
-    'if':'mean',
-    'tss':'sum',
-    'avg_hr':'mean',
-    'max_hr':'max'
-}).reset_index().rename(columns={'date_only':'date'}).sort_values('date')
-
-# ensure merged-ready date column is datetime64[ns]
-daily['date'] = pd.to_datetime(daily['date'], errors='coerce')
-
-# show sample
-st.subheader("Per-day aggregated cycling (sample)")
-st.dataframe(daily.head(10))
+# Distance YoY
+distance_chart = alt.Chart(df.groupby('Year').agg(distance_km=('Distance KM','sum')).reset_index()
+                          ).mark_bar(color='orange').encode(
+    x='Year:O', y='distance_km:Q', tooltip=['Year','distance_km']
+).properties(height=300)
+st.altair_chart(distance_chart, use_container_width=True)
 
 # -------------------------
-# Load sleep CSV (if provided)
+# MTD comparison
 # -------------------------
-sleep_df = None
-if sl_file:
-    try:
-        sleep_raw = pd.read_csv(sl_file)
-        sleep_raw.columns = [c.strip() for c in sleep_raw.columns]
-        # expect header: date,sleep_hours,sleep_quality,resting_hr,hrv
-        sdate_col = find(list(sleep_raw.columns), ["date", "sleep_date", "end_date"])
-        sh_col = find(list(sleep_raw.columns), ["sleep_hours", "duration_hours", "hours", "sleepduration"])
-        sq_col = find(list(sleep_raw.columns), ["sleep_quality", "quality"])
-        srhr_col = find(list(sleep_raw.columns), ["resting_hr", "restingheartrate"])
-        shrv_col = find(list(sleep_raw.columns), ["hrv"])
-        # normalize
-        if sdate_col:
-            sleep_raw['date'] = pd.to_datetime(sleep_raw[sdate_col], errors='coerce')
-        else:
-            sleep_raw['date'] = pd.NaT
-        sleep_raw['sleep_hours'] = safe_num(sleep_raw[sh_col]) if sh_col else np.nan
-        sleep_raw['sleep_quality'] = safe_num(sleep_raw[sq_col]) if sq_col else np.nan
-        sleep_raw['resting_hr'] = safe_num(sleep_raw[srhr_col]) if srhr_col else np.nan
-        sleep_raw['hrv'] = safe_num(sleep_raw[shrv_col]) if shrv_col else np.nan
-        # aggregate per-night (use date's date component)
-        sleep_raw['date'] = pd.to_datetime(sleep_raw['date'], errors='coerce')
-        sleep_raw['date_only'] = sleep_raw['date'].dt.date
-        sleep_df = sleep_raw.groupby('date_only').agg({
-            'sleep_hours':'sum',
-            'sleep_quality':'mean',
-            'resting_hr':'mean',
-            'hrv':'mean'
-        }).reset_index().rename(columns={'date_only':'date'})
-        # make date datetime
-        sleep_df['date'] = pd.to_datetime(sleep_df['date'], errors='coerce')
-        st.subheader("Sleep (per-night)")
-        st.dataframe(sleep_df.head(10))
-    except Exception as e:
-        st.warning(f"Couldn't read/parse sleep CSV: {e}")
-        sleep_df = None
-else:
-    st.info("No sleep file uploaded — sleep-based correlations will be disabled until a file is uploaded.")
+st.subheader(f"Month-to-Date Comparison ({selected_month}/{selected_year})")
+st.write(f"Rides: {mtd_stats['rides']}, Distance (km): {mtd_stats['distance_km']:.1f}, Riding Hours: {mtd_stats['elapsed_hours']:.1f}")
 
 # -------------------------
-# Align sleep -> next-day rides
+# Monthly trends
 # -------------------------
-# Convention: sleep on date D maps to rides on date D+1
-if sleep_df is not None and not sleep_df.empty:
-    sleep_df['next_date'] = sleep_df['date'] + pd.Timedelta(days=1)
-    # normalize types
-    sleep_df['next_date'] = pd.to_datetime(sleep_df['next_date'], errors='coerce')
-    merged = daily.merge(
-        sleep_df[['next_date','sleep_hours','sleep_quality','resting_hr','hrv']].rename(columns={'next_date':'date'}),
-        on='date', how='left'
-    )
-else:
-    merged = daily.copy()
-    merged['sleep_hours'] = np.nan
-    merged['sleep_quality'] = np.nan
-    merged['resting_hr'] = np.nan
-    merged['hrv'] = np.nan
-
-# Ensure merged.date is datetime
-merged['date'] = pd.to_datetime(merged['date'], errors='coerce')
-
-# -------------------------
-# Sidebar: max_hr input (for intensity calc) and FTP not required here
-# -------------------------
-st.sidebar.header("HR & intensity settings")
-user_max_hr = st.sidebar.number_input(
-    "Estimated Max HR (bpm) — used for HR zone/intensity",
-    min_value=120, max_value=250,
-    value=int(np.nanmean(merged['max_hr'].dropna()) if merged['max_hr'].notna().any() else 190)
+st.subheader("Monthly Trends")
+rides_month_chart = alt.Chart(monthly_stats).mark_line(point=True).encode(
+    x='Month_Year:T', y='rides:Q', tooltip=['Month_Year','rides']
 )
-st.sidebar.caption("If unknown, use 220 - age as a rough estimate.")
+st.altair_chart(rides_month_chart, use_container_width=True)
+
+distance_month_chart = alt.Chart(monthly_stats).mark_line(point=True, color='green').encode(
+    x='Month_Year:T', y='distance_km:Q', tooltip=['Month_Year','distance_km']
+)
+st.altair_chart(distance_month_chart, use_container_width=True)
+
+time_month_chart = alt.Chart(monthly_stats).mark_line(point=True, color='purple').encode(
+    x='Month_Year:T', y='elapsed_hours:Q', tooltip=['Month_Year','elapsed_hours']
+)
+st.altair_chart(time_month_chart, use_container_width=True)
 
 # -------------------------
-# HR → Power efficiency
+# Heart Rate Trends
 # -------------------------
-st.header("HR → Power Efficiency")
+st.subheader("Heart Rate Trends")
+avg_hr_chart = alt.Chart(monthly_stats).mark_line(point=True, color='red').encode(
+    x='Month_Year:T', y='avg_hr:Q', tooltip=['Month_Year','avg_hr']
+)
+st.altair_chart(avg_hr_chart, use_container_width=True)
 
-# ensure numeric types
-for c in ['avg_power_w','avg_hr']:
-    if c in merged.columns:
-        merged[c] = pd.to_numeric(merged[c], errors='coerce')
-
-if merged.get('avg_hr').notna().any() and merged.get('avg_power_w').notna().any():
-    merged['watts_per_bpm'] = merged['avg_power_w'] / merged['avg_hr']
-    # show recent trend + distribution
-    st.subheader("Watts per bpm (avg_power / avg_hr) — higher = more efficient")
-    chart = alt.Chart(merged).mark_line(point=True).encode(
-        x=alt.X('date:T', title='Date'),
-        y=alt.Y('watts_per_bpm:Q', title='Watts per bpm'),
-        tooltip=['date','avg_power_w','avg_hr','watts_per_bpm']
-    ).properties(height=300).interactive()
-    st.altair_chart(chart, use_container_width=True)
-    st.write("Higher watts per bpm = more power produced for each heart-beat on average (good).")
-    last_val = merged['watts_per_bpm'].dropna().iloc[-1] if merged['watts_per_bpm'].dropna().size>0 else np.nan
-    st.metric("Most recent watts_per_bpm", f"{last_val:.2f}" if not isnan(last_val) else "N/A")
-else:
-    st.info("Not enough avg_hr or avg_power data to compute watts_per_bpm.")
+max_hr_chart = alt.Chart(monthly_stats).mark_line(point=True, color='blue').encode(
+    x='Month_Year:T', y='max_hr:Q', tooltip=['Month_Year','max_hr']
+)
+st.altair_chart(max_hr_chart, use_container_width=True)
 
 # -------------------------
-# Sleep -> Power correlations (if sleep provided)
+# Averages per month & year
 # -------------------------
-st.header("Sleep → Next-day Performance Correlations")
-
-targets = []
-if merged['avg_power_w'].notna().any():
-    targets.append(('avg_power_w','Average Power (W)'))
-if merged['np_power_w'].notna().any():
-    targets.append(('np_power_w','Normalized Power (W)'))
-if merged['if'].notna().any():
-    targets.append(('if','Intensity Factor'))
-if merged['tss'].notna().any():
-    targets.append(('tss','TSS'))
-
-if sleep_df is None:
-    st.info("Upload sleep CSV to get sleep→power correlations.")
-else:
-    if len(targets) == 0:
-        st.info("No power/NP/IF/TSS columns found to correlate with sleep.")
-    else:
-        for key, pretty in targets:
-            sub = merged[[key,'sleep_hours','date']].dropna()
-            if sub.shape[0] < 5:
-                st.write(f"Not enough overlapping days for **{pretty}** (need ≥5). Found {sub.shape[0]}.")
-                continue
-
-            corr = pearson_r(sub[key], sub['sleep_hours'])
-            st.subheader(f"{pretty} ← Sleep Hours (night before)")
-            st.write(f"Pearson r = **{corr:.3f}**   (n = {len(sub)})")
-
-            # regression line
-            X = sub[['sleep_hours']].values.reshape(-1,1)
-            y = sub[key].values
-            model = LinearRegression().fit(X,y)
-            xs = np.linspace(sub['sleep_hours'].min(), sub['sleep_hours'].max(), 50)
-            ys = model.predict(xs.reshape(-1,1))
-
-            plotdf = pd.DataFrame({
-                'sleep_hours': sub['sleep_hours'],
-                key: sub[key],
-                'date': pd.to_datetime(sub['date'])
-            })
-
-            pts = alt.Chart(plotdf).mark_circle(size=80).encode(
-                x=alt.X('sleep_hours:Q', title='Sleep hours (night before)'),
-                y=alt.Y(f'{key}:Q', title=pretty),
-                tooltip=['date','sleep_hours', key]
-            )
-
-            line = alt.Chart(pd.DataFrame({'sleep_hours': xs, key: ys})).mark_line(color='firebrick', strokeWidth=2).encode(
-                x='sleep_hours:Q', y=f'{key}:Q'
-            )
-
-            st.altair_chart((pts + line).interactive().properties(height=320), use_container_width=True)
-
-            slope = model.coef_[0]
-            intercept = model.intercept_
-            st.write(f"Model: {pretty} ≈ {slope:.2f} × sleep_hours + {intercept:.1f}")
-            if corr > 0.15:
-                st.success(f"Insight: More sleep tends to be associated with higher {pretty} (r={corr:.2f}).")
-            elif corr < -0.15:
-                st.warning(f"Insight: More sleep tends to be associated with lower {pretty} (r={corr:.2f}).")
-            else:
-                st.info(f"No strong linear relationship detected (r={corr:.2f}).")
-
-# -------------------------
-# HR trend charts
-# -------------------------
-st.header("HR Trends")
-
-if merged['avg_hr'].notna().any():
-    st.subheader("Average HR over time")
-    ch = alt.Chart(merged).mark_line(point=True).encode(
-        x=alt.X('date:T', title='Date'),
-        y=alt.Y('avg_hr:Q', title='Average HR (bpm)'),
-        tooltip=['date','avg_hr']
-    ).properties(height=300).interactive()
-    st.altair_chart(ch, use_container_width=True)
-
-if merged['max_hr'].notna().any():
-    st.subheader("Max HR over time")
-    ch2 = alt.Chart(merged).mark_line(point=True, color='orange').encode(
-        x=alt.X('date:T', title='Date'),
-        y=alt.Y('max_hr:Q', title='Max HR (bpm)'),
-        tooltip=['date','max_hr']
-    ).properties(height=250).interactive()
-    st.altair_chart(ch2, use_container_width=True)
-
-# monthly HR summary
-st.subheader("Monthly avg HR summary")
-# SAFELY create month column and ensure types are correct
-merged['month'] = pd.to_datetime(merged['date'], errors='coerce').dt.to_period("M").dt.to_timestamp()
-# convert avg/max to numeric and compute monthly means, drop rows with no values
-merged['avg_hr'] = pd.to_numeric(merged['avg_hr'], errors='coerce')
-merged['max_hr'] = pd.to_numeric(merged['max_hr'], errors='coerce')
-monthly_hr = merged.groupby('month', as_index=False).agg({'avg_hr':'mean','max_hr':'mean'}).reset_index(drop=True)
-# drop rows where both avg_hr and max_hr are NaN
-monthly_hr = monthly_hr.dropna(subset=['avg_hr','max_hr'], how='all')
-if not monthly_hr.empty:
-    # altair prefers clear typings; ensure month is datetime
-    monthly_hr['month'] = pd.to_datetime(monthly_hr['month'], errors='coerce')
-    # melt for line plot with legend
-    melt = monthly_hr.melt(id_vars=['month'], value_vars=['avg_hr','max_hr'], var_name='type', value_name='value')
-    # drop NA rows
-    melt = melt.dropna(subset=['value'])
-    if not melt.empty:
-        mchart = alt.Chart(melt).mark_line(point=True).encode(
-            x=alt.X('month:T', title='Month'),
-            y=alt.Y('value:Q', title='Heart Rate (bpm)'),
-            color=alt.Color('type:N', title='Metric'),
-            tooltip=['month','type','value']
-        ).properties(height=300).interactive()
-        st.altair_chart(mchart, use_container_width=True)
-    else:
-        st.info("Not enough monthly HR data to plot after cleaning.")
-else:
-    st.info("Not enough HR data to produce monthly summary.")
-
-# -------------------------
-# HR-based intensity load
-# (simple, interpretable formula)
-# intensity_pct = avg_hr / user_max_hr
-# hr_load = intensity_pct * moving_hours * 100  (arbitrary scaling like HR-TSS)
-# -------------------------
-st.header("HR-based Intensity Load (per day)")
-
-if merged['avg_hr'].notna().any():
-    merged['intensity_pct'] = merged['avg_hr'] / float(user_max_hr)
-    merged['hr_load'] = merged['intensity_pct'] * merged['moving_hours'] * 100.0  # units: "HR-load"
-    st.subheader("HR-load over time")
-    ch_load = alt.Chart(merged).mark_bar().encode(
-        x=alt.X('date:T', title='Date'),
-        y=alt.Y('hr_load:Q', title='HR Load'),
-        tooltip=['date','hr_load','avg_hr','moving_hours']
-    ).properties(height=300).interactive()
-    st.altair_chart(ch_load, use_container_width=True)
-    st.metric("Total HR-load", f"{merged['hr_load'].sum():.0f}")
-else:
-    st.info("Not enough HR data to compute HR-based intensity load.")
-
-# -------------------------
-# Downloads & wrap up
-# -------------------------
-st.markdown("---")
-st.subheader("Download merged per-day dataset")
-csv_out = merged.to_csv(index=False)
-st.download_button("⬇️ Download merged CSV", data=csv_out, file_name="merged_sleep_hr_power.csv")
-
-st.success("HR features added. Want me to (A) add per-ride tooltips, (B) compute CTL/ATL/TSB fitness curves, or (C) export a one-page PDF report? Reply with A/B/C.")
+st.subheader("Average Metrics")
+st.write(f"Avg rides per month ({selected_year}): {monthly_stats['rides'].mean():.1f}")
+st.write(f"Avg distance per month ({selected_year}): {monthly_stats['distance_km'].mean():.1f} km")
+st.write(f"Avg riding hours per month ({selected_year}): {monthly_stats['elapsed_hours'].mean():.1f} h")
+st.write(f"Avg rides per year (all years): {df.groupby('Year')['Activity ID'].count().mean():.1f}")
+st.write(f"Avg distance per year (all years): {df.groupby('Year')['Distance KM'].sum().mean():.1f} km")
